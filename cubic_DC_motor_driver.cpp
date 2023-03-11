@@ -37,7 +37,7 @@ private:
     const uint8_t PIN_PWM;
     uint8_t slice;
     bool chan;
-    int duty_prev = 0;
+    int16_t duty_prev = 0;
 
 public:
     DC_motor(uint8_t PIN_PWM, uint8_t PIN_DIRE);
@@ -101,7 +101,7 @@ private:
     bool chan_A;
     bool chan_B;
     bool chan_pwm;
-    int duty_prev = 0;
+    int16_t duty_prev = 0;
 
 public:
     SUB_motor(uint8_t PIN_A, uint8_t PIN_B); // コンストラクタ
