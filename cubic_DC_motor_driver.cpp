@@ -4,7 +4,6 @@
 #include "hardware/pwm.h"
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
-#include "iostream"
 
 #include <map>
 #include <cstdlib> // abs() for integer
@@ -15,6 +14,7 @@ using namespace std;
 #define PIN_SS 1
 #define PIN_SCLK 2
 #define PIN_SOMI 3
+#define SPI_FREQ 400000
 
 // (wrap + 1) x clkdiv = (クロック周波数) / (PWM周波数)
 // クロック周波数は125MHz
@@ -25,13 +25,14 @@ using namespace std;
 #define DUTY_DIFF_MAX 70
 #define DUTY_MAX 32767
 
+#define SOLENOID_TIME 10000 // ソレノイドのON時間(us)
+
 #define MAINMOTOR_NUM 8
-#define SUBMOTOR_NUM 4
+#define SOL_SUB_NUM 4 // ソレノイドとサブチャンネルDCモータの数
 
 #define DELAY 1 // 制御分解能(ms)
 
-class DC_motor
-{
+class DC_motor{
 private:
     const uint8_t PIN_DIRE;
     const uint8_t PIN_PWM;
@@ -60,8 +61,7 @@ DC_motor::DC_motor(uint8_t PIN_PWM, uint8_t PIN_DIRE)
     pwm_set_chan_level(slice, chan, 0);
 }
 
-void DC_motor::drive(int16_t duty, float volt, bool ifPrint)
-{
+void DC_motor::drive(int16_t duty, float volt, bool ifPrint){
     // 前回のDutyと同じなら何もしない
     if (duty == duty_prev)
         return;
@@ -92,8 +92,7 @@ DC_motor DCmotors[] = {
     {8, 5},
 };
 
-class SUB_motor
-{
+class SUB_motor{
 private:
     const uint8_t PIN_A;
     const uint8_t PIN_B;
@@ -124,8 +123,7 @@ SUB_motor::SUB_motor(uint8_t PIN_A, uint8_t PIN_B)
     pwm_set_chan_level(slice, chan_B, WRAP_DC + 1);
 }
 
-void SUB_motor::drive(int16_t duty, float volt, bool ifPrint)
-{
+void SUB_motor::drive(int16_t duty, float volt, bool ifPrint){
     // 前回のDutyと同じなら何もしない
     if (duty == duty_prev)
         return;
@@ -166,16 +164,15 @@ SUB_motor SUBmotors[] = {
     {13, 12},
     {7, 6}};
 
-class ADC
-{
+class ADC{
 private:
     const uint8_t PIN;
     static inline const map<uint8_t, uint8_t> PIN_TO_INPUT = {
         {26, 0},
         {27, 1},
         {28, 2},
-        {29, 3}};
-
+        {29, 3}
+    };
 public:
     uint raw_val = 0; // ADCを読んだ生の値
     float volt = 0;   // 計算された電圧値
@@ -189,8 +186,7 @@ ADC::ADC(uint8_t PIN)
     adc_gpio_init(PIN);
 }
 
-void ADC::read(bool ifPrint)
-{
+void ADC::read(bool ifPrint){
     adc_select_input(PIN_TO_INPUT.at(PIN));
     raw_val = adc_read();
     volt = raw_val * 36.3 / 4095.0;
@@ -200,8 +196,122 @@ void ADC::read(bool ifPrint)
 
 ADC Vr1 = ADC(29); //, Vr2 = ADC(28);
 
+class Solenoid {
+private:
+    const uint8_t PIN_A;
+    const uint8_t PIN_B;
+    uint64_t time_pre = time_us_64();
+    bool init = false;
+public:
+    Solenoid(uint8_t PIN_A, uint8_t PIN_B);
+    void begin();
+    void Switch(bool state, bool ifPrint = false);
+    int8_t state = -1; // -1:初期化, 0:OFF, 1:ON
+};
+
+Solenoid::Solenoid(uint8_t PIN_A, uint8_t PIN_B)
+    : PIN_A(PIN_A), PIN_B(PIN_B)
+{
+}
+
+// 最初の1回だけ初期化する関数
+void Solenoid::begin() {
+    if (init == false) {
+        // 初期化
+        gpio_init(PIN_A);
+        gpio_init(PIN_B);
+        gpio_set_dir(PIN_A, GPIO_OUT);
+        gpio_set_dir(PIN_B, GPIO_OUT);
+        gpio_put(PIN_A, 1);
+        gpio_put(PIN_B, 1);
+        init = true;
+    }
+}
+
+void Solenoid::Switch(bool state_new, bool ifPrint) {
+    uint64_t time_now = time_us_64();
+    // SOLENOID_TIME(us)以下の間は何もしない
+    if (time_now - time_pre < SOLENOID_TIME) return;
+
+    if (state == state_new) {
+        // 両方HIGHにする
+        gpio_put(PIN_A, 1);
+        gpio_put(PIN_B, 1);
+        //printf("HIGH HIGH  ");
+    }
+    else {
+        // 一方LOWにする
+        if (state_new) {
+            gpio_put(PIN_A, 1);
+            gpio_put(PIN_B, 0);
+            //printf("HIGH LOW  ");
+        }
+        else {
+            gpio_put(PIN_A, 0);
+            gpio_put(PIN_B, 1);
+            //printf("LOW HIGH  ");
+        }
+        time_pre = time_now;
+        state = state_new;
+    }
+    if (ifPrint)
+        printf("state:%d, time:%d\n", state, time_now);
+}
+
+Solenoid solenoid[] = {
+    {26, 27},
+    {19, 18},
+    {13, 12},
+    { 7,  6}
+};
+
+//SPI通信の情報を受け取るバッファ
+uint8_t buf[MOTOR_NUM*2+SOL_SUB_NUM*2];
+
+void spi_receive(uint gpio, uint32_t events) {
+    if (gpio == PIN_SS && events == GPIO_IRQ_EDGE_FALL) {
+        gpio_set_irq_enabled(PIN_SS, GPIO_IRQ_EDGE_FALL, false);
+
+        gpio_set_function(PIN_SOMI, GPIO_FUNC_SPI);
+        gpio_set_function(PIN_SS,   GPIO_FUNC_SPI);
+
+        spi_read_blocking(SPI_PORT, 0, buf, MOTOR_NUM*2+SOL_SUB_NUM*2);
+
+        gpio_init(PIN_SOMI);
+        gpio_set_dir(PIN_SOMI, GPIO_IN);
+        gpio_init(PIN_SS);
+        gpio_set_dir(PIN_SS, GPIO_IN);
+        gpio_pull_up(PIN_SS);
+
+        gpio_set_irq_enabled(PIN_SS, GPIO_IRQ_EDGE_FALL, true);
+    }
+}
+
 int main()
 {
+    // SPIピンをアクティブにする
+    /*
+        スレーブ動作の際にSSがHIGHのときもMISOがLOWになってしまうSPIライブラリのバグがあるため，
+        MISOとSSをGPIOピンとして初期化し，SSの立ち下がりエッジで割り込み処理をしSPI通信を行う
+    */
+    gpio_set_function(PIN_SIMO, GPIO_FUNC_SPI);
+    //gpio_set_function(PIN_SS,   GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCLK, GPIO_FUNC_SPI);
+    //gpio_set_function(PIN_SOMI, GPIO_FUNC_SPI);
+    gpio_init(PIN_SS);
+    gpio_set_dir(PIN_SS, GPIO_IN);
+    gpio_pull_up(PIN_SS);
+    gpio_init(PIN_SOMI);
+    gpio_set_dir(PIN_SOMI, GPIO_IN);
+
+    // SPI初期化(周波数を4MHzに設定)
+    spi_init(SPI_PORT, SPI_FREQ);
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    // スレーブでSPI通信開始
+    spi_set_slave(SPI_PORT, true);
+
+    gpio_set_irq_enabled_with_callback(PIN_SS, GPIO_IRQ_EDGE_FALL, true, spi_receive);
+    
     // コンデンサーの充電を待つ
     sleep_ms(1000);
 
@@ -212,21 +322,11 @@ int main()
 
     // シリアル通信初期化
     stdio_init_all();
-
-    // SPI初期化(周波数を4MHzに設定)
-    spi_init(SPI_PORT, 4000000);
-    // スレーブでSPI通信開始
-    spi_set_slave(SPI_PORT, true);
-    // SPIピンをアクティブにする
-    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SS, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SCLK, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SOMI, GPIO_FUNC_SPI);
-
+    
     // adc初期化
     adc_init();
 
-    const int motorNum = MAINMOTOR_NUM + SUBMOTOR_NUM;
+    const int motorNum = MAINMOTOR_NUM + SOL_SUB_NUM;
 
     while (true)
     {
@@ -255,7 +355,15 @@ int main()
         }
         for (int i = MAINMOTOR_NUM; i < motorNum; i++) // サブチャンネル
         {
-            SUBmotors[i - MAINMOTOR_NUM].drive(duty[i], Vr1.volt, i == 8);
+            if (abs(sol_sub[i]) != DUTY_MAX+1) {
+                // サブチャンネルDCモータの制御
+                SUBmotors[i - MAINMOTOR_NUM].drive(duty[i], Vr1.volt, i == 8);
+            }
+            else {
+                // ソレノイドの制御
+                solenoid[i].begin();
+                solenoid[i].Switch(sol_sub[i] > 0, false);
+            }
         }
 
         sleep_ms(DELAY);
